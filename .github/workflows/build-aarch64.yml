@@ -1,0 +1,201 @@
+name: Build Flutter Engine aarch64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - dev
+      - pre-release
+      - build*
+    paths:
+      - ".github/workflows/build-aarch64.yml"
+      - "packaging/**"
+
+env:
+  FLUTTER_ELINUX_VERSION: "3.47.0"
+  MECHA_PULP_USERNAME: ${{ secrets.MECHA_PULP_USERNAME }}
+  MECHA_PULP_PASSWORD: ${{ secrets.MECHA_PULP_PASSWORD }}
+  MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+  MECHA_PULP_RPMS_REPOSITORY_NAME: ${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}
+  MECHA_PULP_DEBS_REPOSITORY_NAME: ${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}
+
+jobs:
+  build:
+    name: mechanix-flutter-engine
+    runs-on: ubuntu-24.04-arm
+    environment: pre-release
+    continue-on-error: true
+
+    steps:
+      - name: Resolve host architecture
+        id: host
+        run: |
+          case "$(uname -m)" in
+            aarch64) nfpm_arch=arm64; flutter_arch=arm64; deb_triplet=aarch64-linux-gnu ;;
+            x86_64)  nfpm_arch=amd64; flutter_arch=x64;   deb_triplet=x86_64-linux-gnu ;;
+            *) echo "[ERROR] unsupported host architecture: $(uname -m)"; exit 1 ;;
+          esac
+          echo "nfpm_arch=$nfpm_arch" >> "$GITHUB_OUTPUT"
+          echo "flutter_arch=$flutter_arch" >> "$GITHUB_OUTPUT"
+          echo "deb_triplet=$deb_triplet" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git tar unzip curl xz-utils jq pipx build-essential
+
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.47.0
+          NFPM_ARCH: ${{ steps.host.outputs.nfpm_arch }}
+        run: |
+          curl -fsSL -o nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${NFPM_ARCH}.deb"
+          sudo dpkg -i nfpm.deb
+          rm nfpm.deb
+
+      - name: Install mechanix-packager
+        env:
+          MECHANIX_PACKAGER_VERSION: v0.0.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/mechanix-packager"
+          curl -fsSL "https://github.com/dhruveshb-mecha/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
+          echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Flutter eLinux Toolchain
+        run: |
+          git clone --branch "$FLUTTER_ELINUX_VERSION" --depth 1 https://github.com/flutter-elinux/flutter-elinux.git /opt/flutter-elinux
+
+          if [ ! -x "/opt/flutter-elinux/bin/flutter-elinux" ]; then
+            echo "flutter-elinux binary not found at /opt/flutter-elinux/bin/flutter-elinux"
+            exit 1
+          fi
+
+          echo "/opt/flutter-elinux/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch engine artifacts
+        env:
+          FLUTTER_ARCH: ${{ steps.host.outputs.flutter_arch }}
+        run: |
+          set -euo pipefail
+          flutter-elinux precache --elinux --force
+
+          ENGINE_DIR="/opt/flutter-elinux/flutter/bin/cache/artifacts/engine/elinux-${FLUTTER_ARCH}-release"
+          if [ ! -f "$ENGINE_DIR/libflutter_engine.so" ] || [ ! -f "$ENGINE_DIR/libflutter_elinux_wayland.so" ]; then
+            echo "[ERROR] engine artifacts not found in $ENGINE_DIR"
+            exit 1
+          fi
+
+          mkdir -p ./artifacts
+          cp "$ENGINE_DIR/libflutter_engine.so" ./artifacts/libflutter_engine.so
+          cp "$ENGINE_DIR/libflutter_elinux_wayland.so" ./artifacts/libflutter_elinux_wayland.so
+
+      - name: Resolve deb multiarch triplet
+        env:
+          DEB_TRIPLET: ${{ steps.host.outputs.deb_triplet }}
+        run: |
+          sed -i "s/__DEB_TRIPLET__/${DEB_TRIPLET}/" packaging/nfpm/nfpm.yaml
+
+      - name: Resolve versions
+        id: version
+        run: |
+          set -euo pipefail
+          RPM_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format rpm --upstream "$FLUTTER_ELINUX_VERSION") || { echo "[ERROR] rpm version resolution failed"; exit 1; }
+          DEB_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format deb --upstream "$FLUTTER_ELINUX_VERSION") || { echo "[ERROR] deb version resolution failed"; exit 1; }
+          echo "rpm_release=$(echo "$RPM_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+          echo "deb_release=$(echo "$DEB_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+
+      - name: Package RPM
+        run: |
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats rpm --version "$FLUTTER_ELINUX_VERSION" --release "${{ steps.version.outputs.rpm_release }}"
+
+      - name: Package DEB
+        run: |
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats deb --version "$FLUTTER_ELINUX_VERSION" --release "${{ steps.version.outputs.deb_release }}"
+
+      - name: Check package sizes
+        run: |
+          for EXT in rpm deb; do
+            FILE=$(find ./dist -name "mechanix-flutter-engine*.${EXT}" -type f | head -n1)
+
+            if [ -f "$FILE" ]; then
+              SIZE_MB=$(( $(stat -c%s "$FILE") / 1048576 ))
+              echo "$EXT size: $SIZE_MB MB"
+              if [ "$SIZE_MB" -lt 1 ]; then
+                echo "$EXT file too small: $SIZE_MB MB"
+                exit 1
+              fi
+            else
+              echo "$EXT file not found"
+              exit 1
+            fi
+          done
+
+      - name: Setup | Pulp CLI
+        run: |
+          pipx install --force "pulp-cli==0.39.3"
+          pipx inject pulp-cli pulp-cli-deb pulp_rpm
+
+      - name: Configure Pulp CLI
+        run: |
+          set -euo pipefail
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+          if [ -z "$PULP_API_URL" ]; then
+            echo "MECHA_PULP_API_URL is empty after trimming whitespace"
+            exit 1
+          fi
+
+          pulp config create \
+            --username "$MECHA_PULP_USERNAME" \
+            --password "$MECHA_PULP_PASSWORD" \
+            --base-url "$PULP_API_URL" \
+            --overwrite
+
+      - name: Publish RPM
+        continue-on-error: true
+        run: |
+          RPM_FILE=$(find ./dist -name "mechanix-flutter-engine*.rpm" -type f | head -n1)
+          echo "[INFO] Publishing RPM: $RPM_FILE"
+
+          pulp rpm content upload --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" --file="$RPM_FILE"
+
+          PUB_HREF=$(pulp rpm publication create \
+            --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
+
+          pulp rpm distribution update \
+            --name="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" \
+            --base-path="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" \
+            --publication="$PUB_HREF"
+
+      - name: Publish DEB
+        continue-on-error: true
+        run: |
+          DEB_FILE=$(find ./dist -name "mechanix-flutter-engine*.deb" -type f | head -n1)
+          echo "[INFO] Publishing DEB: $DEB_FILE"
+
+          pulp deb content upload --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" --file="$DEB_FILE"
+
+          PUB_HREF=$(pulp deb publication create \
+            --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
+
+          pulp deb distribution update \
+            --name="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" \
+            --base-path="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" \
+            --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}"
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mechanix-flutter-engine
+          path: |
+            ./artifacts/*.so
+            ./dist/*.rpm
+            ./dist/*.deb
