@@ -12,6 +12,9 @@ license: BSD
 
 overrides:
   rpm:
+    depends:
+      - bash
+      - glibc
     contents:
       - src: ./artifacts/libflutter_engine.so
         dst: /usr/lib64/libflutter_engine.so
@@ -22,6 +25,9 @@ overrides:
         file_info:
           mode: 0644
   deb:
+    depends:
+      - bash
+      - libc6
     contents:
       - src: ./artifacts/libflutter_engine.so
         dst: /usr/lib/__DEB_TRIPLET__/libflutter_engine.so
