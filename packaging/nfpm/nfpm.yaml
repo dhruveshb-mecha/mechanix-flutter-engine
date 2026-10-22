@@ -15,6 +15,7 @@ overrides:
     depends:
       - bash
       - glibc
+      - mechanix-flutter-engine-data = ${PKG_VERSION}
     contents:
       - src: ./artifacts/libflutter_engine.so
         dst: /usr/lib64/libflutter_engine.so
@@ -28,6 +29,7 @@ overrides:
     depends:
       - bash
       - libc6
+      - "mechanix-flutter-engine-data (= ${PKG_VERSION})"
     contents:
       - src: ./artifacts/libflutter_engine.so
         dst: /usr/lib/__DEB_TRIPLET__/libflutter_engine.so

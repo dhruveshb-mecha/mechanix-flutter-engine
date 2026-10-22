@@ -87,14 +87,20 @@ jobs:
           flutter-elinux precache --elinux --force
 
           ENGINE_DIR="/opt/flutter-elinux/flutter/bin/cache/artifacts/engine/elinux-${FLUTTER_ARCH}-release"
+          ICU_FILE="/opt/flutter-elinux/flutter/bin/cache/artifacts/engine/elinux-common/icu/icudtl.dat"
           if [ ! -f "$ENGINE_DIR/libflutter_engine.so" ] || [ ! -f "$ENGINE_DIR/libflutter_elinux_wayland.so" ]; then
             echo "[ERROR] engine artifacts not found in $ENGINE_DIR"
+            exit 1
+          fi
+          if [ ! -f "$ICU_FILE" ]; then
+            echo "[ERROR] icudtl.dat not found at $ICU_FILE"
             exit 1
           fi
 
           mkdir -p ./artifacts
           cp "$ENGINE_DIR/libflutter_engine.so" ./artifacts/libflutter_engine.so
           cp "$ENGINE_DIR/libflutter_elinux_wayland.so" ./artifacts/libflutter_elinux_wayland.so
+          cp "$ICU_FILE" ./artifacts/icudtl.dat
 
       - name: Resolve deb multiarch triplet
         env:
@@ -111,6 +117,11 @@ jobs:
           echo "rpm_release=$(echo "$RPM_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
           echo "deb_release=$(echo "$DEB_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
 
+          RPM_DATA_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format rpm --name mechanix-flutter-engine-data --upstream "$FLUTTER_ELINUX_VERSION") || { echo "[ERROR] data rpm version resolution failed"; exit 1; }
+          DEB_DATA_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format deb --name mechanix-flutter-engine-data --upstream "$FLUTTER_ELINUX_VERSION") || { echo "[ERROR] data deb version resolution failed"; exit 1; }
+          echo "rpm_data_release=$(echo "$RPM_DATA_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+          echo "deb_data_release=$(echo "$DEB_DATA_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+
       - name: Package RPM
         run: |
           python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats rpm --version "$FLUTTER_ELINUX_VERSION" --release "${{ steps.version.outputs.rpm_release }}"
@@ -119,10 +130,18 @@ jobs:
         run: |
           python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats deb --version "$FLUTTER_ELINUX_VERSION" --release "${{ steps.version.outputs.deb_release }}"
 
+      - name: Package data (RPM + DEB)
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$FLUTTER_ELINUX_VERSION" PKG_RELEASE="${{ steps.version.outputs.rpm_data_release }}" \
+            nfpm pkg --config packaging/nfpm/nfpm-data.yaml --packager rpm --target ./dist
+          PKG_VERSION="$FLUTTER_ELINUX_VERSION" PKG_RELEASE="${{ steps.version.outputs.deb_data_release }}" \
+            nfpm pkg --config packaging/nfpm/nfpm-data.yaml --packager deb --target ./dist
+
       - name: Check package sizes
         run: |
           for EXT in rpm deb; do
-            FILE=$(find ./dist -name "mechanix-flutter-engine*.${EXT}" -type f | head -n1)
+            FILE=$(find ./dist \( -name "mechanix-flutter-engine-[0-9]*.${EXT}" -o -name "mechanix-flutter-engine_[0-9]*.${EXT}" \) -type f | head -n1)
 
             if [ -f "$FILE" ]; then
               SIZE_MB=$(( $(stat -c%s "$FILE") / 1048576 ))
@@ -161,10 +180,10 @@ jobs:
       - name: Publish RPM
         continue-on-error: true
         run: |
-          RPM_FILE=$(find ./dist -name "mechanix-flutter-engine*.rpm" -type f | head -n1)
-          echo "[INFO] Publishing RPM: $RPM_FILE"
-
-          pulp rpm content upload --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" --file="$RPM_FILE"
+          for RPM_FILE in $(find ./dist -name "mechanix-flutter-engine*.rpm" -type f); do
+            echo "[INFO] Publishing RPM: $RPM_FILE"
+            pulp rpm content upload --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" --file="$RPM_FILE"
+          done
 
           PUB_HREF=$(pulp rpm publication create \
             --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
@@ -177,10 +196,10 @@ jobs:
       - name: Publish DEB
         continue-on-error: true
         run: |
-          DEB_FILE=$(find ./dist -name "mechanix-flutter-engine*.deb" -type f | head -n1)
-          echo "[INFO] Publishing DEB: $DEB_FILE"
-
-          pulp deb content upload --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" --file="$DEB_FILE"
+          for DEB_FILE in $(find ./dist -name "mechanix-flutter-engine*.deb" -type f); do
+            echo "[INFO] Publishing DEB: $DEB_FILE"
+            pulp deb content upload --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" --file="$DEB_FILE"
+          done
 
           PUB_HREF=$(pulp deb publication create \
             --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
@@ -197,5 +216,6 @@ jobs:
           name: mechanix-flutter-engine
           path: |
             ./artifacts/*.so
+            ./artifacts/icudtl.dat
             ./dist/*.rpm
             ./dist/*.deb

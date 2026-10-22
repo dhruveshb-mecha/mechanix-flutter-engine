@@ -1,0 +1,17 @@
+name: mechanix-flutter-engine-data
+arch: all
+platform: linux
+version: "${PKG_VERSION}"
+release: "${PKG_RELEASE}"
+section: libs
+priority: optional
+maintainer: "Dhruvesh B <dhruveshb@mechasystems.com>"
+description: Shared flutter-elinux ICU data (icudtl.dat) for Mechanix apps
+homepage: https://github.com/mecha-org/mechanix-flutter-engine.git
+license: BSD
+
+contents:
+  - src: ./artifacts/icudtl.dat
+    dst: /usr/share/mechanix/flutter/icudtl.dat
+    file_info:
+      mode: 0644
